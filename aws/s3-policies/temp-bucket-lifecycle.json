@@ -1,0 +1,23 @@
+{
+    "Rules": [
+        {
+            "Id": "DeleteTempFilesAfter7Days",
+            "Status": "Enabled",
+            "Prefix": "temp/",
+            "Expiration": {
+                "Days": 7
+            },
+            "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 7
+            }
+        },
+        {
+            "Id": "CleanupIncompleteMultipartUploads",
+            "Status": "Enabled",
+            "Prefix": "",
+            "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+            }
+        }
+    ]
+}
