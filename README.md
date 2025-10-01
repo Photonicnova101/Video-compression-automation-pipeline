@@ -1,5 +1,5 @@
 
-# Configuration Guide[github_readme (1).md](https://github.com/user-attachments/files/22628778/github_readme.1.md)# Video Compression Automation Pipeline
+# Video Compression Automation Pipeline
 
 [![AWS](https://img.shields.io/badge/AWS-Lambda%20%7C%20S3%20%7C%20MediaConvert-orange)](https://aws.amazon.com/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue)](https://www.python.org/)
