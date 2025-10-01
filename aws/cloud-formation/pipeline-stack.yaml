@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Video Compression Automation Pipeline - Complete Infrastructure Stack'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: video-compression-pipeline
+    Description: Project name for resource naming
+
+  BucketPrefix:
+    Type: String
+    Default: sam-pautrat
+    Description: Prefix for S3 bucket names
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for SNS notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  AirtableBaseId:
+    Type: String
+    Description: Airtable Base ID
+    NoEcho: true
+
+  AirtableApiKey:
+    Type: String
+    Description: Airtable Personal Access Token
+    NoEcho: true
+
+Resources:
+  # ==========================================
+  # S3 Buckets
+  # ==========================================
+  
+  TempProcessingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-temp-processing'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTempFilesAfter7Days
+            Status: Enabled
+            Prefix: temp/
+            ExpirationInDays: 7
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Temporary video processing storage
+
+  CompressedVideosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-compressed-videos'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Final compressed video storage
+
+  # ==========================================
+  # IAM Roles
+  # ==========================================
+
+  MediaConvertServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MediaConvertServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediaconvert.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaConvertServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt TempProcessingBucket.Arn
+                  - !Sub '${TempProcessingBucket.Arn}/*'
+                  - !GetAtt CompressedVideosBucket.Arn
+                  - !Sub '${CompressedVideosBucket.Arn}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Sid: S3Permissions
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:HeadObject
+                Resource:
+                  - !GetAtt TempProcessingBucket.Arn
+                  - !Sub '${TempProcessingBucket.Arn}/*'
+                  - !GetAtt CompressedVideosBucket.Arn
+                  - !Sub '${CompressedVideosBucket.Arn}/*'
+              - Sid: MediaConvertPermissions
+                Effect: Allow
+                Action:
+                  - mediaconvert:CreateJob
+                  - mediaconvert:GetJob
+                  - mediaconvert:ListJobs
+                  - mediaconvert:DescribeEndpoints
+                  - mediaconvert:GetQueue
+                  - mediaconvert:ListQueues
+                Resource: '*'
+              - Sid: SNSPermissions
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              - Sid: IAMPassRolePermissions
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt MediaConvertServiceRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: mediaconvert.amazonaws.com
+              - Sid: LambdaInvokePermissions
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt MetaDataLoggerFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # SNS Topic
+  # ==========================================
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: video-compression-notifications
+      DisplayName: Video Compression Pipeline Notifications
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Lambda Functions
+  # ==========================================
+
+  VideoFileProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: video-file-processor
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          TEMP_BUCKET: !Ref TempProcessingBucket
+          COMPRESSED_BUCKET: !Ref CompressedVideosBucket
+          MEDIACONVERT_ROLE: !GetAtt MediaConvertServiceRole.Arn
+          SNS_TOPIC: !Ref NotificationTopic
+          MEDIACONVERT_ENDPOINT: !Sub 'https://${AWS::AccountId}.mediaconvert.${AWS::Region}.amazonaws.com'
+      Code:
+        ZipFile: |
+          # Placeholder - Deploy actual code separately
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Deploy actual function code'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CompletionHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: completion-handler
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          TEMP_BUCKET: !Ref TempProcessingBucket
+          COMPRESSED_BUCKET: !Ref CompressedVideosBucket
+          SNS_TOPIC: !Ref NotificationTopic
+          METADATA_LOGGER_FUNCTION: !Ref MetaDataLoggerFunction
+          MEDIACONVERT_ENDPOINT: !Sub 'https://${AWS::AccountId}.mediaconvert.${AWS::Region}.amazonaws.com'
+      Code:
+        ZipFile: |
+          # Placeholder - Deploy actual code separately
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Deploy actual function code'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MetaDataLoggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MetaDataLogger
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          AIRTABLE_BASE_ID: !Ref AirtableBaseId
+          AIRTABLE_TABLE_NAME: Processed Videos
+          AIRTABLE_API_KEY: !Ref AirtableApiKey
+      Code:
+        ZipFile: |
+          # Placeholder - Deploy actual code separately
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Deploy actual function code'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # EventBridge Rule
+  # ==========================================
+
+  MediaConvertEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: MediaConvertJobStateChange
+      Description: Trigger completion-handler when MediaConvert jobs complete
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.mediaconvert
+        detail-type:
+          - MediaConvert Job State Change
+        detail:
+          status:
+            - COMPLETE
+            - ERROR
+      Targets:
+        - Arn: !GetAtt CompletionHandlerFunction.Arn
+          Id: CompletionHandlerTarget
+
+  MediaConvertEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CompletionHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MediaConvertEventRule.Arn
+
+  # ==========================================
+  # CloudWatch Log Groups
+  # ==========================================
+
+  VideoFileProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/video-file-processor
+      RetentionInDays: 7
+
+  CompletionHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/completion-handler
+      RetentionInDays: 7
+
+  MetaDataLoggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/MetaDataLogger
+      RetentionInDays: 7
+
+  # ==========================================
+  # CloudWatch Alarms
+  # ==========================================
+
+  VideoProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: video-processor-errors
+      AlarmDescription: Alert when video processor has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VideoFileProcessorFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  CompletionHandlerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: completion-handler-errors
+      AlarmDescription: Alert when completion handler has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CompletionHandlerFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  TempBucketName:
+    Description: S3 bucket for temporary processing
+    Value: !Ref TempProcessingBucket
+    Export:
+      Name: !Sub '${ProjectName}-temp-bucket'
+
+  CompressedBucketName:
+    Description: S3 bucket for compressed videos
+    Value: !Ref CompressedVideosBucket
+    Export:
+      Name: !Sub '${ProjectName}-compressed-bucket'
+
+  MediaConvertRoleArn:
+    Description: IAM Role ARN for MediaConvert
+    Value: !GetAtt MediaConvertServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-mediaconvert-role'
+
+  LambdaExecutionRoleArn:
+    Description: IAM Role ARN for Lambda functions
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-role'
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic'
+
+  VideoFileProcessorFunctionArn:
+    Description: ARN of video-file-processor Lambda function
+    Value: !GetAtt VideoFileProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-file-processor-arn'
+
+  CompletionHandlerFunctionArn:
+    Description: ARN of completion-handler Lambda function
+    Value: !GetAtt CompletionHandlerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-completion-handler-arn'
+
+  MetaDataLoggerFunctionArn:
+    Description: ARN of MetaDataLogger Lambda function
+    Value: !GetAtt MetaDataLoggerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-metadata-logger-arn'
+
+  MediaConvertEndpoint:
+    Description: MediaConvert endpoint URL for this region
+    Value: !Sub 'https://${AWS::AccountId}.mediaconvert.${AWS::Region}.amazonaws.com'
+
+  StackName:
+    Description: CloudFormation stack name
+    Value: !Ref AWS::StackName
